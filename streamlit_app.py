@@ -5,7 +5,6 @@ import numpy as np
 import google.generativeai as genai
 from sklearn.ensemble import RandomForestClassifier
 import plotly.graph_objects as go
-import time
 
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Gemini AI Live Trader", layout="wide")
@@ -32,12 +31,12 @@ class MarketData:
             if data.empty: 
                 return None
             
-            # --- CRITICAL FIX FOR YFINANCE UPDATES ---
-            # If yfinance returns a MultiIndex (e.g., ('Close', 'AAPL')), flatten it to just 'Close'
+            # --- FIX FOR YFINANCE FORMATTING ---
+            # If yfinance returns a MultiIndex (e.g., ('Close', 'AAPL')), flatten it
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.get_level_values(0)
             
-            # Ensure columns are float type
+            # Ensure columns are numeric floats
             cols_to_fix = ['Open', 'High', 'Low', 'Close', 'Volume']
             for col in cols_to_fix:
                 if col in data.columns:
@@ -154,8 +153,8 @@ if data is not None and not data.empty:
     # Analyze
     latest = processed_data.iloc[-1]
     
-    # --- SAFE VALUE EXTRACTION ---
-    # We explicitly convert these to python floats to avoid TypeError
+    # --- ERROR FIX 1: Explicit Float Conversion ---
+    # We force the data to be a simple Python number so formatting works
     current_price = float(latest['Close'])
     rsi_val = float(latest['RSI'])
     
@@ -169,10 +168,33 @@ if data is not None and not data.empty:
     with col2: st.metric("RSI", f"{rsi_val:.1f}")
     with col3: st.metric("AI Sentiment", f"{sentiment:.2f}")
     
-    # Signal Logic
+    # --- ERROR FIX 2: Complete Logic ---
     signal = "NEUTRAL"
     color = "gray"
+    
+    # This logic block was broken in your screenshot. It is fixed now:
     if pred == 1 and prob > 0.6 and sentiment > 0.1:
         signal = "BUY"
         color = "green"
-    elif pred == 0 and
+    elif pred == 0 and prob < 0.4 and sentiment < -0.1:
+        signal = "SELL"
+        color = "red"
+        
+    with col4: 
+        st.markdown(f"### :{color}[{signal}]")
+        st.caption(f"ML Confidence: {prob:.2f}")
+
+    # Charts
+    fig = go.Figure()
+    fig.add_trace(go.Candlestick(x=processed_data.index,
+                    open=processed_data['Open'], high=processed_data['High'],
+                    low=processed_data['Low'], close=processed_data['Close'], name='Price'))
+    fig.add_trace(go.Scatter(x=processed_data.index, y=processed_data['VWAP'], line=dict(color='orange'), name='VWAP'))
+    fig.update_layout(height=400, margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+    
+    with st.expander("Gemini Market Analysis"):
+        st.write(news)
+
+else:
+    st.error("Could not fetch data. The market might be closed or the ticker symbol is invalid.")
