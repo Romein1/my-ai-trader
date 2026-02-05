@@ -3,245 +3,235 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import google.generativeai as genai
-from sklearn.ensemble import RandomForestClassifier
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import plotly.graph_objects as go
 import plotly.express as px
-import time
+import pytz
+from datetime import datetime, timedelta
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Gemini Pro Trading Terminal", layout="wide", page_icon="💹")
+st.set_page_config(page_title="Gemini Live Terminal Pro", layout="wide", page_icon="📈")
 
-# --- AUTHENTICATION ---
+# --- AUTHENTICATION & CONFIG ---
 try:
     api_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=api_key)
     API_AVAILABLE = True
 except:
     API_AVAILABLE = False
+    st.error("⚠️ GEMINI_API_KEY missing in Secrets.")
 
-# --- CONFIGURATION ---
-WATCHLIST = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'AMD', 'NFLX', 'INTC']
+# NSE Watchlist
+WATCHLIST = {
+    'NIFTY 50': '^NSEI',
+    'BANK NIFTY': '^NSEBANK',
+    'RELIANCE': 'RELIANCE.NS',
+    'HDFC BANK': 'HDFCBANK.NS',
+    'TATA MOTORS': 'TATAMOTORS.NS',
+    'INFOSYS': 'INFY.NS',
+    'ICICI BANK': 'ICICIBANK.NS',
+    'ADANI ENT': 'ADANIENT.NS',
+    'SBI': 'SBIN.NS',
+    'ITC': 'ITC.NS'
+}
 
-# --- ADVANCED ANALYSIS CLASS ---
-class MarketEngine:
-    def __init__(self, tickers):
-        self.tickers = tickers
+# --- QUANT ENGINE ---
+class QuantEngine:
+    def __init__(self, ticker):
+        self.ticker = ticker
 
-    def get_batch_data(self):
-        """Fetches data for ALL stocks in watchlist at once"""
+    def get_data(self, period="5d", interval="15m"):
         try:
-            data = yf.download(self.tickers, period="5d", interval="15m", group_by='ticker', progress=False)
-            return data
-        except Exception as e:
-            st.error(f"Data Fetch Error: {e}")
-            return None
-
-    def analyze_ticker(self, ticker_data):
-        """Calculates indicators for a single stock"""
-        df = ticker_data.copy()
-        if df.empty: return None
-
-        # Fix MultiIndex if present
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+            df = yf.download(self.ticker, period=period, interval=interval, progress=False)
+            if df.empty: return None
             
-        # 1. RSI (Momentum)
-        delta = df['Close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['RSI'] = 100 - (100 / (1 + rs))
+            # Flatten MultiIndex if exists
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            
+            return df
+        except: return None
 
-        # 2. VWAP (Trend)
+    def add_technical_indicators(self, df):
+        df = df.copy()
+        
+        # 1. VWAP (Volume Weighted Average Price)
         df['VWAP'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
 
-        # 3. Buyers vs Sellers (Money Flow Proxy)
-        # If Close > Open, we assume buying pressure. If Close < Open, selling.
-        df['Buy_Vol'] = np.where(df['Close'] > df['Open'], df['Volume'], 0)
-        df['Sell_Vol'] = np.where(df['Close'] < df['Open'], df['Volume'], 0)
+        # 2. VWMA (Volume Weighted Moving Average)
+        df['PV'] = df['Close'] * df['Volume']
+        df['VWMA'] = df['PV'].rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
+
+        # 3. VMA (Variable Moving Average)
+        # Uses Chande Momentum Oscillator (CMO) to adjust smoothing
+        period = 9
+        df['Mom'] = df['Close'].diff()
+        df['Abs_Mom'] = df['Mom'].abs()
+        df['Mom_Sum'] = df['Mom'].rolling(window=period).sum().abs()
+        df['Abs_Mom_Sum'] = df['Abs_Mom'].rolling(window=period).sum()
+        df['ER'] = df['Mom_Sum'] / df['Abs_Mom_Sum'] # Efficiency Ratio
+        df['SC'] = df['ER'] * (2/(2+1) - 2/(30+1)) + 2/(30+1) # Smoothing Constant
+        df['VMA'] = 0.0
+        # Calculate VMA iteratively
+        vma_values = [df['Close'].iloc[0]]
+        for i in range(1, len(df)):
+            sc = df['SC'].iloc[i]
+            if pd.isna(sc): sc = 0.1
+            prev_vma = vma_values[-1]
+            vma = prev_vma + sc * (df['Close'].iloc[i] - prev_vma)
+            vma_values.append(vma)
+        df['VMA'] = vma_values
+
+        # 4. SuperTrend (Volatility Stop)
+        atr_period = 10
+        multiplier = 3.0
+        high_low = df['High'] - df['Low']
+        high_close = np.abs(df['High'] - df['Close'].shift())
+        low_close = np.abs(df['Low'] - df['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        true_range = np.max(ranges, axis=1)
+        df['ATR'] = true_range.rolling(atr_period).mean()
         
-        # 4. Support & Resistance (Pivot Points)
-        last_day = df.iloc[-20:] # Last ~5 hours
-        df['Support'] = last_day['Low'].min()
-        df['Resistance'] = last_day['High'].max()
+        df['Basic_Upper'] = (df['High'] + df['Low']) / 2 + multiplier * df['ATR']
+        df['Basic_Lower'] = (df['High'] + df['Low']) / 2 - multiplier * df['ATR']
+        
+        # SuperTrend Logic (Simplified for speed)
+        df['SuperTrend'] = df['Basic_Lower'] # Default view
+        df['Trend'] = np.where(df['Close'] > df['VMA'], 1, -1) # Using VMA as trend baseline
 
         return df.dropna()
 
-class MLBrain:
+# --- GEMINI LIVE NEWS AGENT ---
+class NewsAgent:
     def __init__(self):
-        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
-    
-    def get_prediction(self, df):
-        # Prepare Data
-        df['Target'] = (df['Close'].shift(-1) > df['Close']).astype(int)
-        features = ['RSI', 'VWAP', 'Open', 'Volume']
+        # We use a tool config to enable Google Search
+        self.tools = [
+            {"google_search": {}} # Enables Live Search Grounding
+        ]
+        self.model = genai.GenerativeModel('gemini-1.5-flash', tools=self.tools)
+
+    def get_live_analysis(self, ticker, price_data):
+        if not API_AVAILABLE: return "⚠️ API Key Needed for Live News"
         
-        train_df = df.dropna()
-        if len(train_df) < 50: return 0, 0.5 # Not enough data
-
-        X = train_df[features]
-        y = train_df['Target']
+        current_price = price_data['Close']
+        change = price_data['Close'] - price_data['Open']
         
-        self.model.fit(X, y)
+        # Prompt forces Gemini to use Google Search tool
+        prompt = f"""
+        Use Google Search to find the latest LIVE news (last 24 hours) for {ticker} (Indian Stock Market).
         
-        latest = df.iloc[-1][features].values.reshape(1, -1)
-        pred = self.model.predict(latest)[0]
-        prob = self.model.predict_proba(latest)[0][1]
+        Technical Context:
+        - Price: {current_price}
+        - Day Change: {change}
         
-        return pred, prob
-
-# --- MAIN APP LOGIC ---
-st.title("💹 Gemini AI Pro Terminal")
-
-# 1. SIDEBAR - CONTROL PANEL
-with st.sidebar:
-    st.header("📡 Market Scanner")
-    refresh_btn = st.button("🔄 Scan Market Now", type="primary")
-    selected_ticker = st.selectbox("Select Stock for Deep Dive", WATCHLIST)
-    
-    st.markdown("---")
-    st.markdown("### 🤖 AI Settings")
-    risk_tolerance = st.select_slider("Risk Profile", options=["Conservative", "Balanced", "Aggressive"], value="Balanced")
-
-# 2. DATA PROCESSING
-engine = MarketEngine(WATCHLIST)
-ml = MLBrain()
-
-if 'market_data' not in st.session_state or refresh_btn:
-    with st.spinner("Scanning Global Markets..."):
-        st.session_state['market_data'] = engine.get_batch_data()
-        st.toast("Market Data Updated!")
-
-raw_data = st.session_state['market_data']
-
-if raw_data is not None:
-    # --- DASHBOARD: MARKET OVERVIEW ---
-    st.subheader("🔥 Live Intraday Scanner")
-    
-    scanner_results = []
-    
-    for t in WATCHLIST:
+        Task:
+        1. Find top 2 breaking news headlines for {ticker} today.
+        2. Analyze if this news is Bullish (Positive) or Bearish (Negative).
+        3. Combine this with the technical price action.
+        
+        Output format:
+        "NEWS: [Headline] - [Impact]"
+        "VERDICT: [BULLISH/BEARISH] because..."
+        """
+        
         try:
-            # Handle YFinance weirdness with MultiIndex
-            stock_df = raw_data[t].copy() if isinstance(raw_data.columns, pd.MultiIndex) else raw_data
+            response = self.model.generate_content(prompt)
+            # Check if we got a grounded response (from search)
+            return response.text
+        except Exception as e:
+            return f"Gemini connection error: {e}"
+
+# --- DASHBOARD ---
+st.title("🇮🇳 Gemini Live Terminal: VMA & News Edition")
+
+# Sidebar
+with st.sidebar:
+    st.header("🎮 Command Center")
+    ticker_key = st.selectbox("Select Asset", list(WATCHLIST.keys()))
+    ticker_sym = WATCHLIST[ticker_key]
+    refresh = st.button("⚡ Refresh Live Data & News")
+
+# Main Execution
+engine = QuantEngine(ticker_sym)
+news_bot = NewsAgent()
+
+if 'data' not in st.session_state or refresh:
+    with st.spinner(f"Fetching {ticker_key} data & searching live news..."):
+        raw_df = engine.get_data()
+        if raw_df is not None:
+            processed_df = engine.add_technical_indicators(raw_df)
+            st.session_state['data'] = processed_df
+            st.session_state['latest'] = processed_df.iloc[-1]
             
-            processed = engine.analyze_ticker(stock_df)
-            if processed is not None:
-                latest = processed.iloc[-1]
-                pred, prob = ml.get_prediction(processed)
-                
-                # Signal Logic
-                signal = "HOLD"
-                score = 0
-                if pred == 1 and prob > 0.6: 
-                    signal = "BUY"
-                    score = 1
-                elif pred == 0 and prob < 0.4: 
-                    signal = "SELL"
-                    score = -1
-                
-                scanner_results.append({
-                    "Ticker": t,
-                    "Price": f"${latest['Close']:.2f}",
-                    "RSI": f"{latest['RSI']:.1f}",
-                    "Prediction": signal,
-                    "Confidence": f"{prob*100:.0f}%",
-                    "Score": score # Hidden for sorting
-                })
-        except:
-            continue
+            # Fetch Live News Analysis only on refresh to save API quota
+            st.session_state['news_analysis'] = news_bot.get_live_analysis(ticker_key, st.session_state['latest'])
+        else:
+            st.error("Market closed or data unavailable.")
 
-    # Create Scanner Dataframe
-    scan_df = pd.DataFrame(scanner_results)
+if 'data' in st.session_state:
+    df = st.session_state['data']
+    latest = st.session_state['latest']
     
-    # Styling signals
-    def color_signal(val):
-        color = 'white'
-        if val == "BUY": color = '#4CAF50' # Green
-        elif val == "SELL": color = '#FF5252' # Red
-        return f'color: {color}; font-weight: bold'
+    # --- SECTION 1: LIVE NEWS & SENTIMENT ---
+    st.subheader(f"📰 Live News Intelligence ({ticker_key})")
+    with st.chat_message("assistant", avatar="🤖"):
+        st.write(st.session_state['news_analysis'])
+        st.caption("ℹ️ Analyzed using Google Search Grounding + Technical Data")
 
-    st.dataframe(scan_df.drop('Score', axis=1).style.map(color_signal, subset=['Prediction']), use_container_width=True)
-
-    # --- DEEP DIVE SECTION ---
+    # --- SECTION 2: VMAT (VMA) & TRADING METRICS ---
     st.markdown("---")
-    st.header(f"🔎 Deep Dive: {selected_ticker}")
+    c1, c2, c3, c4 = st.columns(4)
     
-    # Get specific stock data
-    stock_df = raw_data[selected_ticker].copy()
-    processed = engine.analyze_ticker(stock_df)
-    latest = processed.iloc[-1]
-    pred, prob = ml.get_prediction(processed)
+    # Safe float conversion
+    price = float(latest['Close'])
+    vwap = float(latest['VWAP'])
+    vma = float(latest['VMA'])
     
-    # 1. KEY METRICS ROW
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Current Price", f"${latest['Close']:.2f}", f"{(latest['Close'] - processed.iloc[-2]['Close']):.2f}")
-    with col2:
-        st.metric("Support (Buy Zone)", f"${latest['Support']:.2f}")
-    with col3:
-        st.metric("Resistance (Sell Zone)", f"${latest['Resistance']:.2f}")
-    with col4:
-        # Buyer vs Seller Pressure Gauge
-        buy_pressure = latest['Buy_Vol']
-        sell_pressure = latest['Sell_Vol']
-        total = buy_pressure + sell_pressure
-        if total == 0: total = 1
-        buy_pct = (buy_pressure / total) 
-        st.metric("Buying Pressure", f"{buy_pct*100:.0f}%")
-        st.progress(buy_pct)
+    with c1: 
+        st.metric("Live Price", f"₹{price:.2f}", f"{price - float(df.iloc[-2]['Close']):.2f}")
+    with c2:
+        # VMA Logic: If Price > VMA, Trend is Up
+        delta_vma = price - vma
+        st.metric("VMAT (Trend Line)", f"₹{vma:.2f}", f"{delta_vma:.2f}", delta_color="normal")
+    with c3:
+        # VWAP Logic
+        st.metric("VWAP (Inst. Price)", f"₹{vwap:.2f}", "Bullish" if price > vwap else "Bearish")
+    with c4:
+        # Volume Spike Detection
+        vol_avg = df['Volume'].rolling(20).mean().iloc[-1]
+        is_spike = latest['Volume'] > (vol_avg * 1.5)
+        st.metric("Volume Status", "🔥 High" if is_spike else "❄️ Normal", f"{int(latest['Volume'])}")
 
-    # 2. ADVANCED CHARTS
-    tab1, tab2 = st.tabs(["📈 Technical Chart", "📊 Order Book Analysis"])
+    # --- SECTION 3: ADVANCED CHARTING ---
+    st.subheader("📊 Intraday Technicals (VMA + VWAP)")
+    
+    tab1, tab2 = st.tabs(["Price Action", "Trend Strength"])
     
     with tab1:
         fig = go.Figure()
-        # Candles
-        fig.add_trace(go.Candlestick(x=processed.index, open=processed['Open'], high=processed['High'],
-                        low=processed['Low'], close=processed['Close'], name='Price'))
-        # VWAP
-        fig.add_trace(go.Scatter(x=processed.index, y=processed['VWAP'], line=dict(color='orange', width=2), name='VWAP'))
-        # Support/Resistance
-        fig.add_hline(y=latest['Support'], line_dash="dash", line_color="green", annotation_text="Support")
-        fig.add_hline(y=latest['Resistance'], line_dash="dash", line_color="red", annotation_text="Resistance")
+        # Candlestick
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'],
+                        low=df['Low'], close=df['Close'], name='Price'))
         
-        fig.update_layout(height=500, margin=dict(l=0, r=0, t=30, b=0))
+        # VMA (The "Smart" Moving Average)
+        fig.add_trace(go.Scatter(x=df.index, y=df['VMA'], line=dict(color='purple', width=2), name='VMA (Trend)'))
+        
+        # VWAP (Institutional Level)
+        fig.add_trace(go.Scatter(x=df.index, y=df['VWAP'], line=dict(color='orange', width=2, dash='dot'), name='VWAP'))
+        
+        # SuperTrend (Stop Loss)
+        fig.add_trace(go.Scatter(x=df.index, y=df['SuperTrend'], line=dict(color='green', width=1), name='Stop Loss Zone'))
+
+        fig.update_layout(height=500, xaxis_rangeslider_visible=False, title=f"{ticker_key} - VMA & VWAP Analysis")
         st.plotly_chart(fig, use_container_width=True)
 
     with tab2:
-        st.info("💡 Buyer/Seller Pressure is estimated from Intraday Volume Flow.")
-        # Volume Color Chart
-        colors = ['red' if row['Open'] > row['Close'] else 'green' for index, row in processed.iterrows()]
-        fig_vol = go.Figure(data=[go.Bar(x=processed.index, y=processed['Volume'], marker_color=colors)])
-        fig_vol.update_layout(title="Volume Flow (Green=Buying, Red=Selling)", height=300)
-        st.plotly_chart(fig_vol, use_container_width=True)
+        # Volatility & Efficiency
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df.index, y=df['ER'], fill='tozeroy', name='Market Efficiency (ER)'))
+        fig2.update_layout(title="Market Efficiency (Close to 1 = Strong Trend, Close to 0 = Choppy)", height=300)
+        st.plotly_chart(fig2, use_container_width=True)
 
-    # 3. GEMINI AI ADVISOR
-    st.subheader("🧠 Gemini AI Strategy")
-    if API_AVAILABLE:
-        if st.button("Generate AI Trade Plan"):
-            with st.spinner("Gemini is analyzing market structure..."):
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                prompt = f"""
-                Analyze {selected_ticker} based on this data:
-                - Price: {latest['Close']}
-                - RSI: {latest['RSI']} (Over 70=Overbought, Under 30=Oversold)
-                - VWAP: {latest['VWAP']} (Price above VWAP is bullish)
-                - Support: {latest['Support']}
-                - Resistance: {latest['Resistance']}
-                
-                Risk Profile: {risk_tolerance}.
-                
-                Give a strict INTRADAY trading plan in 3 bullet points:
-                1. Entry Price (Where to buy/sell)
-                2. Stop Loss (Where to cut losses)
-                3. Target (Where to take profit)
-                """
-                response = model.generate_content(prompt)
-                st.success("Analysis Complete")
-                st.write(response.text)
-    else:
-        st.warning("Connect Gemini API Key in Secrets for AI Plans")
-
-else:
-    st.error("Waiting for data... Click 'Scan Market Now'")
+    # --- SECTION 4: AI VERDICT ---
+    st.success(f"**Final Strategy:** {'BUY ON DIPS' if price > vma and price > vwap else 'SELL ON RISE' if price < vma else 'WAIT'}")
+    st.info("VMA Rule: If Price is ABOVE the Purple Line (VMA), the trend is strong. If Price cuts BELOW, exit immediately.")
